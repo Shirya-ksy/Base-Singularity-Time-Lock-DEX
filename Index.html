@@ -1,0 +1,193 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+contract SingularityTimeLockDEX {
+    enum OrderState { Placed, Executed, Canceled }
+
+    struct LimitOrder {
+        address payable maker;
+        uint256 ethAmount;
+        uint256 expectedReturnTokens;
+        uint256 validUntil;
+        OrderState state;
+        bytes32 assetPair;
+    }
+
+    address payable public immutable dexOwner;
+    string public exchangeTag;
+    uint256 public tradingFeeBps; // 25 = 0.25%
+    uint256 public orderCount;
+    uint256 public totalLiquidityDepth;
+    uint256 public accumulatedTradingFees;
+    bool public isDEXHalted;
+
+    mapping(uint256 => LimitOrder) public orders;
+    mapping(bytes32 => bool) public supportedPairs;
+    mapping(address => uint256) public userLiquidityShare;
+
+    event PairListed(bytes32 indexed pairKey);
+    event PairDelisted(bytes32 indexed pairKey);
+    event LiquidityAdded(address indexed provider, uint256 amount);
+    event LiquidityRemoved(address indexed provider, uint256 amount);
+    event OrderPlaced(uint256 indexed orderId, address indexed maker, bytes32 indexed pairKey, uint256 amount);
+    event OrderExecuted(uint256 indexed orderId, uint256 settlementAmount);
+    event OrderCanceled(uint256 indexed orderId, uint256 refundedETH);
+    event TradingFeeUpdated(uint256 newFeeBps);
+    event ExchangeTagUpdated(string newTag);
+    event CircuitBreakerToggled(bool isHalted);
+    event FeeHarvested(address indexed receiver, uint256 amount);
+
+    modifier onlyOwner() {
+        require(msg.sender == dexOwner, "SingularityDEX: Caller is not owner");
+        _;
+    }
+
+    modifier whenOperational() {
+        require(!isDEXHalted, "SingularityDEX: Exchange halted");
+        _;
+    }
+
+    constructor() {
+        dexOwner = payable(msg.sender);
+        exchangeTag = "Singularity Base TimeLock DEX v1";
+        tradingFeeBps = 25; // 0.25%
+        isDEXHalted = false;
+    }
+
+    // 1. Добавление поддерживаемой торговой пары
+    function listAssetPair(bytes32 pairKey) external onlyOwner {
+        require(!supportedPairs[pairKey], "SingularityDEX: Pair exists");
+        supportedPairs[pairKey] = true;
+        emit PairListed(pairKey);
+    }
+
+    // 2. Делистинг торговой пары
+    function delistAssetPair(bytes32 pairKey) external onlyOwner {
+        require(supportedPairs[pairKey], "SingularityDEX: Pair does not exist");
+        supportedPairs[pairKey] = false;
+        emit PairDelisted(pairKey);
+    }
+
+    // 3. Поставка ликвидности в резервный пул DEX
+    function addLiquidity() external payable whenOperational {
+        require(msg.value > 0, "SingularityDEX: Zero liquidity");
+
+        userLiquidityShare[msg.sender] += msg.value;
+        totalLiquidityDepth += msg.value;
+
+        emit LiquidityAdded(msg.sender, msg.value);
+    }
+
+    // 4. Размещение лимитного ордера с блокировкой по времени
+    function placeTimeLockOrder(
+        bytes32 pairKey,
+        uint256 expectedTokens,
+        uint256 validityDurationSeconds
+    ) external payable whenOperational returns (uint256) {
+        require(supportedPairs[pairKey], "SingularityDEX: Unsupported pair");
+        require(msg.value > 0, "SingularityDEX: Value must be positive");
+        require(validityDurationSeconds >= 60, "SingularityDEX: Min duration 60s");
+
+        uint256 fee = (msg.value * tradingFeeBps) / 10000;
+        uint256 netValue = msg.value - fee;
+        accumulatedTradingFees += fee;
+
+        orderCount++;
+        orders[orderCount] = LimitOrder({
+            maker: payable(msg.sender),
+            ethAmount: netValue,
+            expectedReturnTokens: expectedTokens,
+            validUntil: block.timestamp + validityDurationSeconds,
+            state: OrderState.Placed,
+            assetPair: pairKey
+        });
+
+        emit OrderPlaced(orderCount, msg.sender, pairKey, netValue);
+        return orderCount;
+    }
+
+    // 5. Исполнение ордера расчетным механизмом (выплата мейкеру)
+    function executeOrder(uint256 orderId) external whenOperational {
+        LimitOrder storage ord = orders[orderId];
+        require(orderId > 0 && orderId <= orderCount, "SingularityDEX: Invalid ID");
+        require(ord.state == OrderState.Placed, "SingularityDEX: Not in placed state");
+        require(block.timestamp <= ord.validUntil, "SingularityDEX: Order expired");
+
+        ord.state = OrderState.Executed;
+        uint256 payout = ord.ethAmount;
+        ord.ethAmount = 0;
+
+        (bool sent, ) = ord.maker.call{value: payout}("");
+        require(sent, "SingularityDEX: Settlement transfer failed");
+
+        emit OrderExecuted(orderId, payout);
+    }
+
+    // 6. Отмена ордера мейкером с возвратом ETH
+    function cancelOrder(uint256 orderId) external {
+        LimitOrder storage ord = orders[orderId];
+        require(orderId > 0 && orderId <= orderCount, "SingularityDEX: Invalid ID");
+        require(ord.maker == msg.sender, "SingularityDEX: Only maker can cancel");
+        require(ord.state == OrderState.Placed, "SingularityDEX: Cannot cancel");
+
+        ord.state = OrderState.Canceled;
+        uint256 refund = ord.ethAmount;
+        ord.ethAmount = 0;
+
+        (bool sent, ) = ord.maker.call{value: refund}("");
+        require(sent, "SingularityDEX: Refund failed");
+
+        emit OrderCanceled(orderId, refund);
+    }
+
+    // 7. Изъятие предоставленной ликвидности
+    function removeLiquidity(uint256 amount) external {
+        require(userLiquidityShare[msg.sender] >= amount, "SingularityDEX: Insufficient share");
+
+        userLiquidityShare[msg.sender] -= amount;
+        totalLiquidityDepth -= amount;
+
+        (bool sent, ) = payable(msg.sender).call{value: amount}("");
+        require(sent, "SingularityDEX: Liquidity return failed");
+
+        emit LiquidityRemoved(msg.sender, amount);
+    }
+
+    // 8. Корректировка комиссии DEX
+    function setTradingFee(uint256 newFeeBps) external onlyOwner {
+        require(newFeeBps <= 200, "SingularityDEX: Max fee 2%");
+        tradingFeeBps = newFeeBps;
+        emit TradingFeeUpdated(newFeeBps);
+    }
+
+    // 9. Аварийная пауза / запуск торгов
+    function toggleEmergencyHalt(bool halt) external onlyOwner {
+        isDEXHalted = halt;
+        emit CircuitBreakerToggled(halt);
+    }
+
+    // 10. Сбор комиссионной прибыли биржи
+    function harvestTradingFees() external onlyOwner {
+        uint256 fees = accumulatedTradingFees;
+        require(fees > 0, "SingularityDEX: No fees to harvest");
+
+        accumulatedTradingFees = 0;
+        (bool sent, ) = dexOwner.call{value: fees}("");
+        require(sent, "SingularityDEX: Harvest failed");
+
+        emit FeeHarvested(dexOwner, fees);
+    }
+
+    // Чтение информации об ордере
+    function getOrder(uint256 orderId) external view returns (
+        address maker,
+        uint256 ethAmount,
+        uint256 expectedTokens,
+        uint256 validUntil,
+        OrderState state,
+        bytes32 assetPair
+    ) {
+        LimitOrder memory ord = orders[orderId];
+        return (ord.maker, ord.ethAmount, ord.expectedReturnTokens, ord.validUntil, ord.state, ord.assetPair);
+    }
+}
